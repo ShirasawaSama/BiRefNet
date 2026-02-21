@@ -13,11 +13,32 @@ from models.modules.lateral_blocks import BasicLatBlk
 from models.modules.aspp import ASPP, ASPPDeformable
 
 
-def image2patches(image, grid_h=2, grid_w=2, patch_ref=None, transformation='b c (hg h) (wg w) -> (b hg wg) c h w'):
-    if patch_ref is not None:
-        grid_h, grid_w = image.shape[-2] // patch_ref.shape[-2], image.shape[-1] // patch_ref.shape[-1]
-    patches = rearrange(image, transformation, hg=grid_h, wg=grid_w)
-    return patches
+# 替换掉开头的 einops 引入，并重写这个函数
+# from einops import rearrange  <-- 删掉或者不用它
+
+def image2patches(image, grid_h=2, grid_w=2, patch_ref=None, transformation='b c (hg h) (wg w) -> (b hg wg) c h w'):  
+    B, C, H, W = image.shape
+    if patch_ref is not None:  
+        # 使用原生 Tensor shape 运算，避免 einops 的复杂推导
+        ref_h, ref_w = patch_ref.shape[2], patch_ref.shape[3]
+        grid_h, grid_w = H // ref_h, W // ref_w
+        h, w = ref_h, ref_w
+    else:
+        h, w = H // grid_h, W // grid_w
+    
+    if transformation == 'b c (hg h) (wg w) -> b (c hg wg) h w':  
+        # 对应代码中的使用场景，纯 GPU 操作，0 拷贝
+        x = image.view(B, C, grid_h, h, grid_w, w)
+        x = x.permute(0, 1, 2, 4, 3, 5).contiguous()
+        # 用 flatten 合并维度，不生成复杂的 Shape 节点
+        patches = x.flatten(1, 3) 
+    else:
+        # 默认场景
+        x = image.view(B, C, grid_h, h, grid_w, w)
+        x = x.permute(0, 2, 4, 1, 3, 5).contiguous()
+        patches = x.view(-1, C, h, w)
+        
+    return patches  
 
 def patches2image(patches, grid_h=2, grid_w=2, patch_ref=None, transformation='(b hg wg) c h w -> b c (hg h) (wg w)'):
     if patch_ref is not None:
@@ -83,7 +104,7 @@ class BiRefNet(
                 x2 = x2 + F.interpolate(x2_, size=x2.shape[2:], mode='bilinear', align_corners=True)
                 x3 = x3 + F.interpolate(x3_, size=x3.shape[2:], mode='bilinear', align_corners=True)
                 x4 = x4 + F.interpolate(x4_, size=x4.shape[2:], mode='bilinear', align_corners=True)
-        class_preds = self.cls_head(self.avgpool(x4).view(x4.shape[0], -1)) if self.training and self.config.auxiliary_classification else None
+        class_preds = self.cls_head(self.avgpool(x4).flatten(1)) if self.training and self.config.auxiliary_classification else None
         if self.config.cxt:
             x4 = torch.cat(
                 (
@@ -193,19 +214,17 @@ class Decoder(nn.Module):
             x, x1, x2, x3, x4, gdt_gt = features
         else:
             x, x1, x2, x3, x4 = features
-        size_x1_to_x4_template = [(x.shape[2] // (2 ** i), x.shape[3] // (2 ** i)) for i in (2, 3, 4, 5)]
-        if self.use_pyramid_neck:
-            x1 = F.interpolate(x1, size=size_x1_to_x4_template[0], mode='bilinear', align_corners=True)
-            x1 = self.pyramid_neck_x1(x1)
+        # 删掉 size_x1_to_x4_template 这一行
+        if self.use_pyramid_neck:  
+            _, _, H, W = x.shape
+            x1 = F.interpolate(x1, size=(H // 4, W // 4), mode='bilinear', align_corners=True)  
+            
+            x2 = F.interpolate(x2, size=(H // 8, W // 8), mode='bilinear', align_corners=True)  
+            
+            x3 = F.interpolate(x3, size=(H // 16, W // 16), mode='bilinear', align_corners=True)  
+            
+            x4 = F.interpolate(x4, size=(H // 32, W // 32), mode='bilinear', align_corners=True)  
 
-            x2 = F.interpolate(x2, size=size_x1_to_x4_template[1], mode='bilinear', align_corners=True)
-            x2 = self.pyramid_neck_x2(x2)
-
-            x3 = F.interpolate(x3, size=size_x1_to_x4_template[2], mode='bilinear', align_corners=True)
-            x3 = self.pyramid_neck_x3(x3)
-
-            x4 = F.interpolate(x4, size=size_x1_to_x4_template[3], mode='bilinear', align_corners=True)
-            x4 = self.pyramid_neck_x4(x4)
         outs = []
 
         if self.config.dec_ipt:

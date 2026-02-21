@@ -40,8 +40,8 @@ def window_partition(x, window_size):
     Returns:
         windows: (num_windows*B, window_size, window_size, C)
     """
-    B, H, W, C = x.shape
-    x = x.view(B, H // window_size, window_size, W // window_size, window_size, C)
+    _, H, W, C = x.shape
+    x = x.view(-1, H // window_size, window_size, W // window_size, window_size, C)
     windows = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(-1, window_size, window_size, C)
     return windows
 
@@ -119,10 +119,10 @@ class WindowAttention(nn.Module):
             x: input features with shape of (num_windows*B, N, C)
             mask: (0/-inf) mask with shape of (num_windows, Wh*Ww, Wh*Ww) or None
         """
-        B_, N, C = x.shape
+        _, N, C = x.shape
         assert N == self.window_size[0] * self.window_size[1], "N must equal Wh*Ww for Swin window attention"
 
-        qkv = self.qkv(x).reshape(B_, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
+        qkv = self.qkv(x).reshape(-1, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
         q, k, v = qkv.unbind(0)  # [B_, H, N, Dh]
         relative_position_bias = self.relative_position_bias_table[self.relative_position_index.view(-1)].view(
             N, N, -1
@@ -141,7 +141,7 @@ class WindowAttention(nn.Module):
                 dropout_p=self.attn_drop_prob if self.training else 0.0,
                 is_causal=False
             )  # [B_, H, N, Dh]
-            x = attn_out.transpose(1, 2).reshape(B_, N, C)
+            x = attn_out.transpose(1, 2).reshape(-1, N, C)
         else:
             q = q * self.scale
             attn = q @ k.transpose(-2, -1)
@@ -149,11 +149,11 @@ class WindowAttention(nn.Module):
 
             if mask is not None:
                 nW = mask.shape[0]
-                attn = attn.view(B_ // nW, nW, self.num_heads, N, N) + mask.unsqueeze(0)
+                attn = attn.view(-1 // nW, nW, self.num_heads, N, N) + mask.unsqueeze(0)
                 attn = attn.view(-1, self.num_heads, N, N)
             attn = self.softmax(attn)
             attn = self.attn_drop(attn)
-            x = (attn @ v).transpose(1, 2).reshape(B_, N, C)
+            x = (attn @ v).transpose(1, 2).reshape(-1, N, C)
         x = self.proj(x)
         x = self.proj_drop(x)
         return x
@@ -215,7 +215,7 @@ class SwinTransformerBlock(nn.Module):
 
         shortcut = x
         x = self.norm1(x)
-        x = x.view(B, H, W, C)
+        x = x.view(-1, H, W, C)
 
         # pad feature maps to multiples of window size  
         pad_r = (self.window_size - W % self.window_size) % self.window_size  
@@ -262,7 +262,7 @@ class SwinTransformerBlock(nn.Module):
 
         x = x[:, :H, :W, :].contiguous()
 
-        x = x.view(B, H * W, C)
+        x = x.view(-1, H * W, C)
 
         # FFN
         x = shortcut + self.drop_path(x)
@@ -294,7 +294,7 @@ class PatchMerging(nn.Module):
         B, L, C = x.shape
         assert L == H * W, "input feature has wrong size"
 
-        x = x.view(B, H, W, C)
+        x = x.view(-1, H, W, C)
 
         # padding
         pad_r = W % 2
@@ -311,7 +311,7 @@ class PatchMerging(nn.Module):
         x2 = x[:, 0::2, 1::2, :]  # B H/2 W/2 C
         x3 = x[:, 1::2, 1::2, :]  # B H/2 W/2 C
         x = torch.cat([x0, x1, x2, x3], -1)  # B H/2 W/2 4*C
-        x = x.view(B, -1, 4 * C)  # B H/2*W/2 4*C
+        x = x.flatten(1, 2)  # B H/2*W/2 4*C
 
         x = self.norm(x)
         x = self.reduction(x)
