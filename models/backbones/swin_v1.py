@@ -217,12 +217,18 @@ class SwinTransformerBlock(nn.Module):
         x = self.norm1(x)
         x = x.view(B, H, W, C)
 
-        # pad feature maps to multiples of window size
-        pad_l = pad_t = 0
-        pad_r = (self.window_size - W % self.window_size) % self.window_size
-        pad_b = (self.window_size - H % self.window_size) % self.window_size
-        x = F.pad(x, (0, 0, pad_l, pad_r, pad_t, pad_b))
-        _, Hp, Wp, _ = x.shape
+        # pad feature maps to multiples of window size  
+        pad_r = (self.window_size - W % self.window_size) % self.window_size  
+        pad_b = (self.window_size - H % self.window_size) % self.window_size  
+        
+        # 使用 torch.cat 替代 F.pad
+        right_pad = torch.zeros((B, H, pad_r, C), device=x.device, dtype=x.dtype)
+        x = torch.cat((x, right_pad), dim=2)
+        
+        bottom_pad = torch.zeros((B, pad_b, x.size(2), C), device=x.device, dtype=x.dtype)
+        x = torch.cat((x, bottom_pad), dim=1)
+        
+        _, Hp, Wp, _ = x.shape  
 
         # cyclic shift
         if self.shift_size > 0:
@@ -254,8 +260,7 @@ class SwinTransformerBlock(nn.Module):
         else:
             x = shifted_x
 
-        if pad_r > 0 or pad_b > 0:
-            x = x[:, :H, :W, :].contiguous()
+        x = x[:, :H, :W, :].contiguous()
 
         x = x.view(B, H * W, C)
 
@@ -292,9 +297,14 @@ class PatchMerging(nn.Module):
         x = x.view(B, H, W, C)
 
         # padding
-        pad_input = (H % 2 == 1) or (W % 2 == 1)
-        if pad_input:
-            x = F.pad(x, (0, 0, 0, W % 2, 0, H % 2))
+        pad_r = W % 2
+        pad_b = H % 2
+
+        right_pad = torch.zeros((B, H, pad_r, C), device=x.device, dtype=x.dtype)
+        x = torch.cat((x, right_pad), dim=2)
+        
+        bottom_pad = torch.zeros((B, pad_b, x.size(2), C), device=x.device, dtype=x.dtype)
+        x = torch.cat((x, bottom_pad), dim=1)
 
         x0 = x[:, 0::2, 0::2, :]  # B H/2 W/2 C
         x1 = x[:, 1::2, 0::2, :]  # B H/2 W/2 C
@@ -380,8 +390,8 @@ class BasicLayer(nn.Module):
 
         # calculate attention mask for SW-MSA
         # Turn int to torch.tensor for the compatiability with torch.compile in PyTorch >= 2.5.
-        Hp = torch.ceil(torch.tensor(H) / self.window_size).to(torch.int64) * self.window_size
-        Wp = torch.ceil(torch.tensor(W) / self.window_size).to(torch.int64) * self.window_size
+        Hp = (H + self.window_size - 1) // self.window_size * self.window_size
+        Wp = (W + self.window_size - 1) // self.window_size * self.window_size
         img_mask = torch.zeros((1, Hp, Wp, 1), device=x.device)  # 1 Hp Wp 1
         h_slices = (slice(0, -self.window_size),
                     slice(-self.window_size, -self.shift_size),
@@ -438,11 +448,16 @@ class PatchEmbed(nn.Module):
     def forward(self, x):
         """Forward function."""
         # padding
-        _, _, H, W = x.size()
-        if W % self.patch_size[1] != 0:
-            x = F.pad(x, (0, self.patch_size[1] - W % self.patch_size[1]))
-        if H % self.patch_size[0] != 0:
-            x = F.pad(x, (0, 0, 0, self.patch_size[0] - H % self.patch_size[0]))
+        B, C, H, W = x.size()  
+        pad_r = (self.patch_size[1] - W % self.patch_size[1]) % self.patch_size[1]
+        pad_b = (self.patch_size[0] - H % self.patch_size[0]) % self.patch_size[0]
+        
+        # 使用 torch.cat 替代 F.pad，避免 ONNX CPU 回退
+        right_pad = torch.zeros((B, C, H, pad_r), device=x.device, dtype=x.dtype)
+        x = torch.cat((x, right_pad), dim=3)
+        
+        bottom_pad = torch.zeros((B, C, pad_b, x.size(3)), device=x.device, dtype=x.dtype)
+        x = torch.cat((x, bottom_pad), dim=2)
 
         x = self.proj(x)  # B C Wh Ww
         if self.norm is not None:
