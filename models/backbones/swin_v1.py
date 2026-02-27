@@ -40,8 +40,8 @@ def window_partition(x, window_size):
     Returns:
         windows: (num_windows*B, window_size, window_size, C)
     """
-    B, H, W, C = x.shape
-    x = x.view(B, H // window_size, window_size, W // window_size, window_size, C)
+    H, W, C = x.shape[1], x.shape[2], x.shape[3]
+    x = x.view(-1, H // window_size, window_size, W // window_size, window_size, C)
     windows = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(-1, window_size, window_size, C)
     return windows
 
@@ -57,7 +57,7 @@ def window_reverse(windows, window_size, H, W):
     Returns:
         x: (B, H, W, C)
     """
-    C = int(windows.shape[-1])
+    C = windows.shape[-1]
     x = windows.view(-1, H // window_size, W // window_size, window_size, window_size, C)
     x = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(-1, H, W, C)
     return x
@@ -120,7 +120,8 @@ class WindowAttention(nn.Module):
             mask: (0/-inf) mask with shape of (num_windows, Wh*Ww, Wh*Ww) or None
         """
         B_, N, C = x.shape
-        assert N == self.window_size[0] * self.window_size[1], "N must equal Wh*Ww for Swin window attention"
+        if not torch.jit.is_tracing():
+            assert N == self.window_size[0] * self.window_size[1], "N must equal Wh*Ww for Swin window attention"
 
         qkv = self.qkv(x).reshape(B_, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
         q, k, v = qkv.unbind(0)  # [B_, H, N, Dh]
@@ -209,20 +210,22 @@ class SwinTransformerBlock(nn.Module):
             H, W: Spatial resolution of the input feature.
             mask_matrix: Attention mask for cyclic shift.
         """
-        B, L, C = x.shape
         H, W = self.H, self.W
-        assert L == H * W, "input feature has wrong size"
+        C = x.shape[-1]
+        if not torch.jit.is_tracing():
+            L = x.shape[1]
+            assert L == H * W, "input feature has wrong size"
 
         shortcut = x
         x = self.norm1(x)
-        x = x.view(B, H, W, C)
+        x = x.view(-1, H, W, C)
 
         # pad feature maps to multiples of window size
         pad_l = pad_t = 0
         pad_r = (self.window_size - W % self.window_size) % self.window_size
         pad_b = (self.window_size - H % self.window_size) % self.window_size
         x = F.pad(x, (0, 0, pad_l, pad_r, pad_t, pad_b))
-        _, Hp, Wp, _ = x.shape
+        Hp, Wp = H + pad_b, W + pad_r
 
         # cyclic shift
         if self.shift_size > 0:
@@ -254,10 +257,10 @@ class SwinTransformerBlock(nn.Module):
         else:
             x = shifted_x
 
-        if pad_r > 0 or pad_b > 0:
-            x = x[:, :H, :W, :].contiguous()
+        # x = x[:, :H, :W, :].contiguous()
+        x = x[:, :H, :W, :].contiguous()
 
-        x = x.view(B, H * W, C)
+        x = x.view(-1, H * W, C)
 
         # FFN
         x = shortcut + self.drop_path(x)
@@ -286,22 +289,24 @@ class PatchMerging(nn.Module):
             x: Input feature, tensor size (B, H*W, C).
             H, W: Spatial resolution of the input feature.
         """
-        B, L, C = x.shape
-        assert L == H * W, "input feature has wrong size"
+        C = x.shape[-1]
+        if not torch.jit.is_tracing():
+            L = x.shape[1]
+            assert L == H * W, "input feature has wrong size"
 
-        x = x.view(B, H, W, C)
+        x = x.view(-1, H, W, C)
 
         # padding
-        pad_input = (H % 2 == 1) or (W % 2 == 1)
-        if pad_input:
-            x = F.pad(x, (0, 0, 0, W % 2, 0, H % 2))
+        pad_w = W % 2
+        pad_h = H % 2
+        x = F.pad(x, (0, 0, 0, pad_w, 0, pad_h))
 
         x0 = x[:, 0::2, 0::2, :]  # B H/2 W/2 C
         x1 = x[:, 1::2, 0::2, :]  # B H/2 W/2 C
         x2 = x[:, 0::2, 1::2, :]  # B H/2 W/2 C
         x3 = x[:, 1::2, 1::2, :]  # B H/2 W/2 C
         x = torch.cat([x0, x1, x2, x3], -1)  # B H/2 W/2 4*C
-        x = x.view(B, -1, 4 * C)  # B H/2*W/2 4*C
+        x = x.view(-1, (H + 2 * pad_h) // 2 * (W + 2 * pad_w) // 2, 4 * C)  # B H/2*W/2 4*C
 
         x = self.norm(x)
         x = self.reduction(x)
@@ -380,8 +385,8 @@ class BasicLayer(nn.Module):
 
         # calculate attention mask for SW-MSA
         # Turn int to torch.tensor for the compatiability with torch.compile in PyTorch >= 2.5.
-        Hp = torch.ceil(torch.tensor(H) / self.window_size).to(torch.int64) * self.window_size
-        Wp = torch.ceil(torch.tensor(W) / self.window_size).to(torch.int64) * self.window_size
+        Hp = ((H + self.window_size - 1) // self.window_size) * self.window_size
+        Wp = ((W + self.window_size - 1) // self.window_size) * self.window_size
         img_mask = torch.zeros((1, Hp, Wp, 1), device=x.device)  # 1 Hp Wp 1
         h_slices = (slice(0, -self.window_size),
                     slice(-self.window_size, -self.shift_size),
@@ -438,11 +443,10 @@ class PatchEmbed(nn.Module):
     def forward(self, x):
         """Forward function."""
         # padding
-        _, _, H, W = x.size()
-        if W % self.patch_size[1] != 0:
-            x = F.pad(x, (0, self.patch_size[1] - W % self.patch_size[1]))
-        if H % self.patch_size[0] != 0:
-            x = F.pad(x, (0, 0, 0, self.patch_size[0] - H % self.patch_size[0]))
+        H, W = x.shape[2], x.shape[3]
+        pad_w = (self.patch_size[1] - W % self.patch_size[1]) % self.patch_size[1]
+        pad_h = (self.patch_size[0] - H % self.patch_size[0]) % self.patch_size[0]
+        x = F.pad(x, (0, pad_w, 0, pad_h))
 
         x = self.proj(x)  # B C Wh Ww
         if self.norm is not None:
@@ -584,7 +588,7 @@ class SwinTransformer(nn.Module):
         """Forward function."""
         x = self.patch_embed(x)
 
-        Wh, Ww = x.size(2), x.size(3)
+        Wh, Ww = x.shape[2], x.shape[3]
         if self.ape:
             # interpolate the position embedding to the corresponding size
             absolute_pos_embed = F.interpolate(self.absolute_pos_embed, size=(Wh, Ww), mode='bicubic')
