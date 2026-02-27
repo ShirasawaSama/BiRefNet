@@ -6,7 +6,7 @@ import matplotlib.pyplot as plt
 
 
 transform_image = transforms.Compose([
-    transforms.Resize((2048, 2048)),
+    transforms.Resize((1024, 1024)),
     transforms.ToTensor(),
     transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
 ])
@@ -25,7 +25,7 @@ run_options = onnxruntime.SessionOptions()
 run_options.enable_profiling = True
 run_options.log_severity_level = 0
 onnx_session = onnxruntime.InferenceSession(
-    'BiRefNet_HR-matting-epoch_135_fp16.onnx', run_options,
+    'BiRefNet_HR-matting-epoch_135.onnx', run_options,
     providers=providers
 )
 input_name = onnx_session.get_inputs()[0].name

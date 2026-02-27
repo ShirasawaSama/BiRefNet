@@ -59,7 +59,20 @@ def main():
         disable_shape_infer=True,
     )
     print("正在保存...")
-    onnx.save(model_fp16, str(output_path))
+    try:
+        raise Exception("test")
+        onnx.save(model_fp16, str(output_path))
+    except Exception as e:
+        print(f"标准保存失败 (可能是模型过大)，尝试使用外部数据保存: {e}")
+        # 如果模型大于 2GB，需要保存为外部数据
+        external_data_file = output_path.name + ".data"
+        onnx.save(
+            model_fp16,
+            str(output_path),
+            save_as_external_data=True,
+            all_tensors_to_one_file=True,
+            location=external_data_file,
+        )
     print(f"已保存 FP16 模型: {output_path}")
 
 
